@@ -17,7 +17,7 @@ import (
 // Provider Implementation
 // =====================================
 
-// Provider implements gpa.Provider using MongoDB
+// Provider implements gpa.Provider and gpa.DocumentProvider using MongoDB
 type Provider struct {
 	client   *mongo.Client
 	database *mongo.Database
@@ -104,11 +104,126 @@ func (p *Provider) ProviderInfo() gpa.ProviderInfo {
 
 // GetRepository returns a type-safe repository for any entity type T
 // This enables the unified provider API: userRepo := gpamongo.GetRepository[User](provider)
-func GetRepository[T any](p *Provider) gpa.Repository[T] {
+func GetRepository[T any](p *Provider) gpa.DocumentRepository[T] {
 	var zero T
 	collectionName := getCollectionName(zero)
 	collection := p.database.Collection(collectionName)
 	return NewRepository[T](collection, p)
+}
+
+// =====================================
+// DocumentProvider Implementation
+// =====================================
+
+// Database returns the underlying MongoDB database instance
+func (p *Provider) Database() interface{} {
+	return p.database
+}
+
+// Collection returns a collection instance
+func (p *Provider) Collection(name string) interface{} {
+	return p.database.Collection(name)
+}
+
+// CreateIndex creates an index on a collection
+func (p *Provider) CreateIndex(ctx context.Context, collection string, keys interface{}, indexOptions *gpa.IndexOptions) error {
+	coll := p.database.Collection(collection)
+	
+	indexModel := mongo.IndexModel{
+		Keys: keys,
+	}
+	
+	if indexOptions != nil {
+		mongoOpts := &options.IndexOptions{}
+		if indexOptions.Unique {
+			mongoOpts.SetUnique(true)
+		}
+		if indexOptions.Sparse {
+			mongoOpts.SetSparse(true)
+		}
+		if indexOptions.Background {
+			mongoOpts.SetBackground(true)
+		}
+		if indexOptions.Name != "" {
+			mongoOpts.SetName(indexOptions.Name)
+		}
+		if indexOptions.TTL > 0 {
+			mongoOpts.SetExpireAfterSeconds(int32(indexOptions.TTL.Seconds()))
+		}
+		indexModel.Options = mongoOpts
+	}
+	
+	_, err := coll.Indexes().CreateOne(ctx, indexModel)
+	return err
+}
+
+// DropIndex drops an index from a collection
+func (p *Provider) DropIndex(ctx context.Context, collection string, name string) error {
+	coll := p.database.Collection(collection)
+	_, err := coll.Indexes().DropOne(ctx, name)
+	return err
+}
+
+// ListIndexes lists all indexes for a collection
+func (p *Provider) ListIndexes(ctx context.Context, collection string) ([]gpa.IndexInfo, error) {
+	coll := p.database.Collection(collection)
+	cursor, err := coll.Indexes().List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer cursor.Close(ctx)
+	
+	var indexes []gpa.IndexInfo
+	for cursor.Next(ctx) {
+		var indexDoc map[string]interface{}
+		if err := cursor.Decode(&indexDoc); err != nil {
+			continue
+		}
+		
+		indexInfo := gpa.IndexInfo{
+			Name:     indexDoc["name"].(string),
+			Fields:   []string{}, // Convert keys to field names
+			IsUnique: false,
+			Type:     gpa.IndexTypeStandard,
+		}
+		
+		// Convert MongoDB key document to field names
+		if keyDoc, ok := indexDoc["key"].(map[string]interface{}); ok {
+			for field := range keyDoc {
+				indexInfo.Fields = append(indexInfo.Fields, field)
+			}
+		}
+		
+		if unique, ok := indexDoc["unique"]; ok {
+			indexInfo.IsUnique = unique.(bool)
+		}
+		
+		indexes = append(indexes, indexInfo)
+	}
+	
+	return indexes, cursor.Err()
+}
+
+// Aggregate runs an aggregation pipeline
+func (p *Provider) Aggregate(ctx context.Context, collection string, pipeline interface{}) (interface{}, error) {
+	coll := p.database.Collection(collection)
+	cursor, err := coll.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	
+	var results []interface{}
+	if err := cursor.All(ctx, &results); err != nil {
+		return nil, err
+	}
+	
+	return results, nil
+}
+
+// Watch starts a change stream
+func (p *Provider) Watch(ctx context.Context, collection string, pipeline interface{}) (interface{}, error) {
+	coll := p.database.Collection(collection)
+	return coll.Watch(ctx, pipeline)
 }
 
 // getCollectionName returns the collection name for a type
