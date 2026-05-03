@@ -702,46 +702,142 @@ func convertToObjectID(id interface{}) (primitive.ObjectID, error) {
 // =====================================
 
 // setEntityID sets the ID field on an entity using reflection
+// This function performs comprehensive validation to ensure safe reflection operations
 func setEntityID(entity interface{}, id interface{}) error {
-	v := reflect.ValueOf(entity)
-	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
-		return fmt.Errorf("entity must be a pointer to a struct")
+	// Validate entity is not nil
+	if entity == nil {
+		return fmt.Errorf("entity cannot be nil")
 	}
-	
+
+	// Validate id is not nil
+	if id == nil {
+		return fmt.Errorf("id cannot be nil")
+	}
+
+	v := reflect.ValueOf(entity)
+
+	// Check if entity is a pointer
+	if v.Kind() != reflect.Ptr {
+		return fmt.Errorf("entity must be a pointer to a struct, got %v", v.Kind())
+	}
+
+	// Check if pointer is nil
+	if v.IsNil() {
+		return fmt.Errorf("entity pointer is nil")
+	}
+
+	// Dereference pointer
 	v = v.Elem()
-	
+
+	// Check if dereferenced value is a struct
+	if v.Kind() != reflect.Struct {
+		return fmt.Errorf("entity must point to a struct, got %v", v.Kind())
+	}
+
+	// Get struct type to check field properties
+	structType := v.Type()
+
 	// Look for ID field (ID, Id, or _id)
 	var idField reflect.Value
+	var idFieldIdx = -1
+
 	for i := 0; i < v.NumField(); i++ {
-		field := v.Type().Field(i)
+		// Bounds checking - ensure field index is valid
+		if i >= v.NumField() {
+			break
+		}
+
+		field := structType.Field(i)
 		fieldName := field.Name
+
+		// Skip unexported fields - they cannot be set via reflection
+		if field.PkgPath != "" {
+			continue
+		}
+
+		// Check for bson tag
 		bsonTag := field.Tag.Get("bson")
-		
+
+		// Match ID, Id, or _id tag
 		if fieldName == "ID" || fieldName == "Id" || bsonTag == "_id" || bsonTag == "_id,omitempty" {
 			idField = v.Field(i)
+			idFieldIdx = i
 			break
 		}
 	}
-	
-	if !idField.IsValid() {
-		return fmt.Errorf("no ID field found")
+
+	if !idField.IsValid() || idFieldIdx < 0 {
+		return fmt.Errorf("no ID field found in entity")
 	}
-	
+
+	// Verify field can be set (is exported and addressable)
 	if !idField.CanSet() {
-		return fmt.Errorf("ID field cannot be set")
+		return fmt.Errorf("ID field '%s' cannot be set (unexported or non-addressable)", structType.Field(idFieldIdx).Name)
 	}
-	
+
 	// Convert the ID to the appropriate type
 	idValue := reflect.ValueOf(id)
-	if idField.Type() == idValue.Type() {
+	idFieldType := idField.Type()
+	idType := idValue.Type()
+
+	// Direct type match
+	if idFieldType == idType {
 		idField.Set(idValue)
-	} else if idField.Type() == reflect.TypeOf(primitive.ObjectID{}) {
+		return nil
+	}
+
+	// Handle ObjectID conversion
+	if idFieldType == reflect.TypeOf(primitive.ObjectID{}) {
 		if objID, ok := id.(primitive.ObjectID); ok {
 			idField.Set(reflect.ValueOf(objID))
+			return nil
+		}
+		// Try converting string to ObjectID
+		if strID, ok := id.(string); ok {
+			if objID, err := primitive.ObjectIDFromHex(strID); err == nil {
+				idField.Set(reflect.ValueOf(objID))
+				return nil
+			}
 		}
 	}
-	
-	return nil
+
+	// Handle string ID conversion
+	if idFieldType.Kind() == reflect.String && idType.Kind() == reflect.String {
+		idField.Set(idValue)
+		return nil
+	}
+
+	// Handle numeric ID conversion
+	if idFieldType.Kind() == reflect.Int || idFieldType.Kind() == reflect.Int64 {
+		if idType.Kind() == reflect.Int || idType.Kind() == reflect.Int64 {
+			idField.Set(idValue.Convert(idFieldType))
+			return nil
+		}
+		if idType.Kind() == reflect.String {
+			// Try parsing string as int
+			var intVal int64
+			var err error
+			if _, ok := id.(string); ok {
+				_, err = fmt.Sscanf(id.(string), "%d", &intVal)
+			}
+			if err == nil {
+				idField.Set(reflect.ValueOf(intVal).Convert(idFieldType))
+				return nil
+			}
+		}
+	}
+
+	// Handle uint ID conversion
+	if idFieldType.Kind() == reflect.Uint || idFieldType.Kind() == reflect.Uint64 {
+		if idType.Kind() == reflect.Uint || idType.Kind() == reflect.Uint64 {
+			idField.Set(idValue.Convert(idFieldType))
+			return nil
+		}
+	}
+
+	// Type mismatch - cannot convert
+	return fmt.Errorf("type mismatch: cannot set ID field of type %v with value of type %v",
+		idFieldType, idType)
 }
 
 // =====================================
