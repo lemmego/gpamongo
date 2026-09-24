@@ -3,6 +3,7 @@ package gpamongo
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/lemmego/gpa"
@@ -537,6 +538,9 @@ func TestRepositoryTransaction(t *testing.T) {
 	})
 
 	if err != nil {
+		if strings.Contains(err.Error(), "Transaction numbers are only allowed on a replica set") {
+			t.Skip("MongoDB transactions require a replica set or mongos")
+		}
 		t.Errorf("Transaction failed: %v", err)
 	}
 
@@ -579,6 +583,29 @@ func TestRepositoryRawExec(t *testing.T) {
 
 	if !gpa.IsErrorType(err, gpa.ErrorTypeUnsupported) {
 		t.Errorf("Expected unsupported error, got %v", err)
+	}
+}
+
+func TestBuildConditionFilterRejectsUnsupportedCondition(t *testing.T) {
+	repo := &Repository[TestDoc]{}
+
+	_, err := repo.buildConditionFilter(gpa.CompositeCondition{})
+	if err == nil || !gpa.IsErrorType(err, gpa.ErrorTypeUnsupported) {
+		t.Fatalf("expected unsupported condition error, got %v", err)
+	}
+
+	_, _, err = repo.buildQuery(gpa.Where("name", gpa.Operator("unsupported"), "value"))
+	if err == nil || !gpa.IsErrorType(err, gpa.ErrorTypeUnsupported) {
+		t.Fatalf("expected unsupported operator error, got %v", err)
+	}
+}
+
+func TestTransactionRepositoryUsesSessionContext(t *testing.T) {
+	transactionContext := context.WithValue(context.Background(), struct{}{}, "session")
+	repo := &Repository[TestDoc]{transactionContext: transactionContext}
+
+	if got := repo.operationContext(context.Background()); got != transactionContext {
+		t.Fatal("expected transaction operations to use the session context")
 	}
 }
 

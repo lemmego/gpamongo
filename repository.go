@@ -20,8 +20,9 @@ import (
 // RepositoryG implements type-safe MongoDB operations using Go generics.
 // Provides compile-time type safety for all CRUD and document operations.
 type Repository[T any] struct {
-	collection *mongo.Collection
-	provider   *Provider
+	collection         *mongo.Collection
+	provider           *Provider
+	transactionContext context.Context
 }
 
 // NewRepository creates a new generic MongoDB repository for type T.
@@ -39,11 +40,11 @@ func NewRepository[T any](collection *mongo.Collection, provider *Provider) *Rep
 
 // Create inserts a new entity with compile-time type safety.
 func (r *Repository[T]) Create(ctx context.Context, entity *T) error {
-	result, err := r.collection.InsertOne(ctx, entity)
+	result, err := r.collection.InsertOne(r.operationContext(ctx), entity)
 	if err != nil {
 		return convertMongoError(err)
 	}
-	
+
 	// Set the ID on the entity if it was generated
 	if result.InsertedID != nil {
 		// Use reflection to set the ID field
@@ -52,7 +53,7 @@ func (r *Repository[T]) Create(ctx context.Context, entity *T) error {
 			// The document was created successfully
 		}
 	}
-	
+
 	return nil
 }
 
@@ -61,18 +62,18 @@ func (r *Repository[T]) CreateBatch(ctx context.Context, entities []*T) error {
 	if len(entities) == 0 {
 		return nil
 	}
-	
+
 	// Convert []*T to []interface{}
 	docs := make([]interface{}, len(entities))
 	for i, entity := range entities {
 		docs[i] = entity
 	}
-	
-	result, err := r.collection.InsertMany(ctx, docs)
+
+	result, err := r.collection.InsertMany(r.operationContext(ctx), docs)
 	if err != nil {
 		return convertMongoError(err)
 	}
-	
+
 	// Set the IDs on the entities if they were generated
 	if result.InsertedIDs != nil && len(result.InsertedIDs) == len(entities) {
 		for i, id := range result.InsertedIDs {
@@ -82,7 +83,7 @@ func (r *Repository[T]) CreateBatch(ctx context.Context, entities []*T) error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -92,9 +93,9 @@ func (r *Repository[T]) FindByID(ctx context.Context, id interface{}) (*T, error
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var entity T
-	err = r.collection.FindOne(ctx, bson.M{"_id": objectID}).Decode(&entity)
+	err = r.collection.FindOne(r.operationContext(ctx), bson.M{"_id": objectID}).Decode(&entity)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
@@ -103,14 +104,17 @@ func (r *Repository[T]) FindByID(ctx context.Context, id interface{}) (*T, error
 
 // FindAll retrieves all entities with compile-time type safety.
 func (r *Repository[T]) FindAll(ctx context.Context, opts ...gpa.QueryOption) ([]*T, error) {
-	filter, findOptions := r.buildQuery(opts...)
-	
-	cursor, err := r.collection.Find(ctx, filter, findOptions)
+	filter, findOptions, err := r.buildQuery(opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	cursor, err := r.collection.Find(r.operationContext(ctx), filter, findOptions)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
 	defer cursor.Close(ctx)
-	
+
 	var entities []*T
 	for cursor.Next(ctx) {
 		var entity T
@@ -119,11 +123,11 @@ func (r *Repository[T]) FindAll(ctx context.Context, opts ...gpa.QueryOption) ([
 		}
 		entities = append(entities, &entity)
 	}
-	
+
 	if err := cursor.Err(); err != nil {
 		return nil, convertMongoError(err)
 	}
-	
+
 	return entities, nil
 }
 
@@ -133,24 +137,24 @@ func (r *Repository[T]) Update(ctx context.Context, entity *T) error {
 	if err != nil {
 		return err
 	}
-	
+
 	objectID, err := convertToObjectID(id)
 	if err != nil {
 		return err
 	}
-	
-	result, err := r.collection.ReplaceOne(ctx, bson.M{"_id": objectID}, entity)
+
+	result, err := r.collection.ReplaceOne(r.operationContext(ctx), bson.M{"_id": objectID}, entity)
 	if err != nil {
 		return convertMongoError(err)
 	}
-	
+
 	if result.MatchedCount == 0 {
 		return gpa.GPAError{
 			Type:    gpa.ErrorTypeNotFound,
 			Message: "entity not found",
 		}
 	}
-	
+
 	return nil
 }
 
@@ -160,20 +164,20 @@ func (r *Repository[T]) UpdatePartial(ctx context.Context, id interface{}, updat
 	if err != nil {
 		return err
 	}
-	
+
 	updateDoc := bson.M{"$set": updates}
-	result, err := r.collection.UpdateOne(ctx, bson.M{"_id": objectID}, updateDoc)
+	result, err := r.collection.UpdateOne(r.operationContext(ctx), bson.M{"_id": objectID}, updateDoc)
 	if err != nil {
 		return convertMongoError(err)
 	}
-	
+
 	if result.MatchedCount == 0 {
 		return gpa.GPAError{
 			Type:    gpa.ErrorTypeNotFound,
 			Message: "entity not found",
 		}
 	}
-	
+
 	return nil
 }
 
@@ -183,26 +187,29 @@ func (r *Repository[T]) Delete(ctx context.Context, id interface{}) error {
 	if err != nil {
 		return err
 	}
-	
-	result, err := r.collection.DeleteOne(ctx, bson.M{"_id": objectID})
+
+	result, err := r.collection.DeleteOne(r.operationContext(ctx), bson.M{"_id": objectID})
 	if err != nil {
 		return convertMongoError(err)
 	}
-	
+
 	if result.DeletedCount == 0 {
 		return gpa.GPAError{
 			Type:    gpa.ErrorTypeNotFound,
 			Message: "entity not found",
 		}
 	}
-	
+
 	return nil
 }
 
 // DeleteByCondition removes entities matching a condition.
 func (r *Repository[T]) DeleteByCondition(ctx context.Context, condition gpa.Condition) error {
-	filter := r.buildConditionFilter(condition)
-	_, err := r.collection.DeleteMany(ctx, filter)
+	filter, err := r.buildConditionFilter(condition)
+	if err != nil {
+		return err
+	}
+	_, err = r.collection.DeleteMany(r.operationContext(ctx), filter)
 	return convertMongoError(err)
 }
 
@@ -213,11 +220,14 @@ func (r *Repository[T]) Query(ctx context.Context, opts ...gpa.QueryOption) ([]*
 
 // QueryOne retrieves a single entity based on query options.
 func (r *Repository[T]) QueryOne(ctx context.Context, opts ...gpa.QueryOption) (*T, error) {
-	filter, findOptions := r.buildQuery(opts...)
+	filter, findOptions, err := r.buildQuery(opts...)
+	if err != nil {
+		return nil, err
+	}
 	findOptions.SetLimit(1)
-	
+
 	var entity T
-	err := r.collection.FindOne(ctx, filter).Decode(&entity)
+	err = r.collection.FindOne(r.operationContext(ctx), filter).Decode(&entity)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
@@ -226,8 +236,11 @@ func (r *Repository[T]) QueryOne(ctx context.Context, opts ...gpa.QueryOption) (
 
 // Count returns the number of entities matching query options.
 func (r *Repository[T]) Count(ctx context.Context, opts ...gpa.QueryOption) (int64, error) {
-	filter, _ := r.buildQuery(opts...)
-	count, err := r.collection.CountDocuments(ctx, filter)
+	filter, _, err := r.buildQuery(opts...)
+	if err != nil {
+		return 0, err
+	}
+	count, err := r.collection.CountDocuments(r.operationContext(ctx), filter)
 	return count, convertMongoError(err)
 }
 
@@ -244,17 +257,18 @@ func (r *Repository[T]) Transaction(ctx context.Context, fn gpa.TransactionFunc[
 		return convertMongoError(err)
 	}
 	defer session.EndSession(ctx)
-	
+
 	callback := func(sessCtx mongo.SessionContext) (interface{}, error) {
 		txRepo := &Transaction[T]{
 			Repository: &Repository[T]{
-				collection: r.collection,
-				provider:   r.provider,
+				collection:         r.collection,
+				provider:           r.provider,
+				transactionContext: sessCtx,
 			},
 		}
 		return nil, fn(txRepo)
 	}
-	
+
 	_, err = session.WithTransaction(ctx, callback)
 	return convertMongoError(err)
 }
@@ -281,24 +295,24 @@ func (r *Repository[T]) RawExec(ctx context.Context, query string, args []interf
 func (r *Repository[T]) GetEntityInfo() (*gpa.EntityInfo, error) {
 	var zero T
 	entityType := reflect.TypeOf(zero)
-	
+
 	info := &gpa.EntityInfo{
 		Name:      entityType.Name(),
 		TableName: r.collection.Name(),
 		Fields:    make([]gpa.FieldInfo, 0),
 	}
-	
+
 	// Analyze struct fields
 	for i := 0; i < entityType.NumField(); i++ {
 		field := entityType.Field(i)
-		
+
 		fieldInfo := gpa.FieldInfo{
 			Name:         field.Name,
 			Type:         field.Type,
 			DatabaseType: "bson",
 			Tag:          string(field.Tag),
 		}
-		
+
 		// Check for MongoDB-specific tags
 		if bsonTag := field.Tag.Get("bson"); bsonTag != "" {
 			if bsonTag == "_id" || bsonTag == "_id,omitempty" {
@@ -306,10 +320,10 @@ func (r *Repository[T]) GetEntityInfo() (*gpa.EntityInfo, error) {
 				info.PrimaryKey = append(info.PrimaryKey, field.Name)
 			}
 		}
-		
+
 		info.Fields = append(info.Fields, fieldInfo)
 	}
-	
+
 	return info, nil
 }
 
@@ -324,12 +338,12 @@ func (r *Repository[T]) Close() error {
 
 // FindByDocument finds documents that match the given document structure.
 func (r *Repository[T]) FindByDocument(ctx context.Context, document map[string]interface{}) ([]*T, error) {
-	cursor, err := r.collection.Find(ctx, document)
+	cursor, err := r.collection.Find(r.operationContext(ctx), document)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
 	defer cursor.Close(ctx)
-	
+
 	var entities []*T
 	for cursor.Next(ctx) {
 		var entity T
@@ -338,7 +352,7 @@ func (r *Repository[T]) FindByDocument(ctx context.Context, document map[string]
 		}
 		entities = append(entities, &entity)
 	}
-	
+
 	return entities, convertMongoError(cursor.Err())
 }
 
@@ -348,22 +362,22 @@ func (r *Repository[T]) UpdateDocument(ctx context.Context, id interface{}, upda
 	if err != nil {
 		return 0, err
 	}
-	
-	result, err := r.collection.UpdateOne(ctx, bson.M{"_id": objectID}, update)
+
+	result, err := r.collection.UpdateOne(r.operationContext(ctx), bson.M{"_id": objectID}, update)
 	if err != nil {
 		return 0, convertMongoError(err)
 	}
-	
+
 	return result.ModifiedCount, nil
 }
 
 // UpdateManyDocuments updates multiple entities using document-style operations.
 func (r *Repository[T]) UpdateManyDocuments(ctx context.Context, filter map[string]interface{}, update map[string]interface{}) (int64, error) {
-	result, err := r.collection.UpdateMany(ctx, filter, update)
+	result, err := r.collection.UpdateMany(r.operationContext(ctx), filter, update)
 	if err != nil {
 		return 0, convertMongoError(err)
 	}
-	
+
 	return result.ModifiedCount, nil
 }
 
@@ -373,26 +387,26 @@ func (r *Repository[T]) ReplaceDocument(ctx context.Context, id interface{}, ent
 	if err != nil {
 		return nil, err
 	}
-	
+
 	opts := options.FindOneAndReplace().SetReturnDocument(options.After)
-	
+
 	var result T
-	err = r.collection.FindOneAndReplace(ctx, bson.M{"_id": objectID}, entity, opts).Decode(&result)
+	err = r.collection.FindOneAndReplace(r.operationContext(ctx), bson.M{"_id": objectID}, entity, opts).Decode(&result)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
-	
+
 	return &result, nil
 }
 
 // CreateCollection creates a new collection for entity type T.
 func (r *Repository[T]) CreateCollection(ctx context.Context) error {
-	return convertMongoError(r.provider.client.Database(r.collection.Database().Name()).CreateCollection(ctx, r.collection.Name()))
+	return convertMongoError(r.provider.client.Database(r.collection.Database().Name()).CreateCollection(r.operationContext(ctx), r.collection.Name()))
 }
 
 // DropCollection removes the entire collection for entity type T.
 func (r *Repository[T]) DropCollection(ctx context.Context) error {
-	return convertMongoError(r.collection.Drop(ctx))
+	return convertMongoError(r.collection.Drop(r.operationContext(ctx)))
 }
 
 // CreateIndex creates an index on the collection for entity type T.
@@ -402,50 +416,50 @@ func (r *Repository[T]) CreateIndex(ctx context.Context, keys map[string]interfa
 	for key, value := range keys {
 		indexKeys = append(indexKeys, bson.E{Key: key, Value: value})
 	}
-	
+
 	indexModel := mongo.IndexModel{
-		Keys: indexKeys,
+		Keys:    indexKeys,
 		Options: options.Index().SetUnique(unique),
 	}
-	
-	_, err := r.collection.Indexes().CreateOne(ctx, indexModel)
+
+	_, err := r.collection.Indexes().CreateOne(r.operationContext(ctx), indexModel)
 	return convertMongoError(err)
 }
 
 // DropIndex removes an index by name.
 func (r *Repository[T]) DropIndex(ctx context.Context, indexName string) error {
-	_, err := r.collection.Indexes().DropOne(ctx, indexName)
+	_, err := r.collection.Indexes().DropOne(r.operationContext(ctx), indexName)
 	return convertMongoError(err)
 }
 
 // TextSearch performs full-text search on indexed text fields.
 func (r *Repository[T]) TextSearch(ctx context.Context, query string, opts ...gpa.QueryOption) ([]*T, error) {
 	filter := bson.M{"$text": bson.M{"$search": query}}
-	
+
 	// Build additional options
 	findQuery := &gpa.Query{}
 	for _, opt := range opts {
 		opt.Apply(findQuery)
 	}
-	
+
 	findOptions := options.Find()
-	
+
 	// Apply limit
 	if findQuery.Limit != nil {
 		findOptions.SetLimit(int64(*findQuery.Limit))
 	}
-	
+
 	// Apply offset
 	if findQuery.Offset != nil {
 		findOptions.SetSkip(int64(*findQuery.Offset))
 	}
-	
-	cursor, err := r.collection.Find(ctx, filter, findOptions)
+
+	cursor, err := r.collection.Find(r.operationContext(ctx), filter, findOptions)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
 	defer cursor.Close(ctx)
-	
+
 	var entities []*T
 	for cursor.Next(ctx) {
 		var entity T
@@ -454,7 +468,7 @@ func (r *Repository[T]) TextSearch(ctx context.Context, query string, opts ...gp
 		}
 		entities = append(entities, &entity)
 	}
-	
+
 	return entities, convertMongoError(cursor.Err())
 }
 
@@ -471,13 +485,13 @@ func (r *Repository[T]) FindNear(ctx context.Context, field string, point []floa
 			},
 		},
 	}
-	
-	cursor, err := r.collection.Find(ctx, filter)
+
+	cursor, err := r.collection.Find(r.operationContext(ctx), filter)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
 	defer cursor.Close(ctx)
-	
+
 	var entities []*T
 	for cursor.Next(ctx) {
 		var entity T
@@ -486,7 +500,7 @@ func (r *Repository[T]) FindNear(ctx context.Context, field string, point []floa
 		}
 		entities = append(entities, &entity)
 	}
-	
+
 	return entities, convertMongoError(cursor.Err())
 }
 
@@ -502,13 +516,13 @@ func (r *Repository[T]) FindWithinPolygon(ctx context.Context, field string, pol
 			},
 		},
 	}
-	
-	cursor, err := r.collection.Find(ctx, filter)
+
+	cursor, err := r.collection.Find(r.operationContext(ctx), filter)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
 	defer cursor.Close(ctx)
-	
+
 	var entities []*T
 	for cursor.Next(ctx) {
 		var entity T
@@ -517,7 +531,7 @@ func (r *Repository[T]) FindWithinPolygon(ctx context.Context, field string, pol
 		}
 		entities = append(entities, &entity)
 	}
-	
+
 	return entities, convertMongoError(cursor.Err())
 }
 
@@ -532,13 +546,13 @@ func (r *Repository[T]) Aggregate(ctx context.Context, pipeline []map[string]int
 		}
 		bsonPipeline[i] = bsonStage
 	}
-	
-	cursor, err := r.collection.Aggregate(ctx, bsonPipeline)
+
+	cursor, err := r.collection.Aggregate(r.operationContext(ctx), bsonPipeline)
 	if err != nil {
 		return nil, convertMongoError(err)
 	}
 	defer cursor.Close(ctx)
-	
+
 	var results []map[string]interface{}
 	for cursor.Next(ctx) {
 		var result map[string]interface{}
@@ -547,13 +561,13 @@ func (r *Repository[T]) Aggregate(ctx context.Context, pipeline []map[string]int
 		}
 		results = append(results, result)
 	}
-	
+
 	return results, convertMongoError(cursor.Err())
 }
 
 // Distinct returns distinct values for a specified field across the collection.
 func (r *Repository[T]) Distinct(ctx context.Context, field string, filter map[string]interface{}) ([]interface{}, error) {
-	values, err := r.collection.Distinct(ctx, field, filter)
+	values, err := r.collection.Distinct(r.operationContext(ctx), field, filter)
 	return values, convertMongoError(err)
 }
 
@@ -568,36 +582,39 @@ func (r *Repository[T]) Distinct(ctx context.Context, field string, filter map[s
 // =====================================
 
 // buildQuery builds MongoDB filter and find options from GPA query options
-func (r *Repository[T]) buildQuery(opts ...gpa.QueryOption) (bson.M, *options.FindOptions) {
+func (r *Repository[T]) buildQuery(opts ...gpa.QueryOption) (bson.M, *options.FindOptions, error) {
 	query := &gpa.Query{}
-	
+
 	// Apply all options
 	for _, opt := range opts {
 		opt.Apply(query)
 	}
-	
+
 	// Build filter
 	filter := bson.M{}
 	for _, condition := range query.Conditions {
-		conditionFilter := r.buildConditionFilter(condition)
+		conditionFilter, err := r.buildConditionFilter(condition)
+		if err != nil {
+			return nil, nil, err
+		}
 		for key, value := range conditionFilter {
 			filter[key] = value
 		}
 	}
-	
+
 	// Build find options
 	findOptions := options.Find()
-	
+
 	// Apply limit
 	if query.Limit != nil {
 		findOptions.SetLimit(int64(*query.Limit))
 	}
-	
+
 	// Apply offset
 	if query.Offset != nil {
 		findOptions.SetSkip(int64(*query.Offset))
 	}
-	
+
 	// Apply sorting
 	if len(query.Orders) > 0 {
 		sort := bson.D{}
@@ -610,7 +627,7 @@ func (r *Repository[T]) buildQuery(opts ...gpa.QueryOption) (bson.M, *options.Fi
 		}
 		findOptions.SetSort(sort)
 	}
-	
+
 	// Apply field projection
 	if len(query.Fields) > 0 {
 		projection := bson.M{}
@@ -619,43 +636,69 @@ func (r *Repository[T]) buildQuery(opts ...gpa.QueryOption) (bson.M, *options.Fi
 		}
 		findOptions.SetProjection(projection)
 	}
-	
-	return filter, findOptions
+
+	return filter, findOptions, nil
 }
 
 // buildConditionFilter builds a MongoDB filter from a GPA condition
-func (r *Repository[T]) buildConditionFilter(condition gpa.Condition) bson.M {
-	// Basic implementation - can be enhanced later
+func (r *Repository[T]) buildConditionFilter(condition gpa.Condition) (bson.M, error) {
 	switch cond := condition.(type) {
 	case gpa.BasicCondition:
 		field := cond.Field()
 		operator := cond.Operator()
 		value := cond.Value()
-		
+
 		switch operator {
 		case gpa.OpEqual:
-			return bson.M{field: value}
+			return bson.M{field: value}, nil
 		case gpa.OpNotEqual:
-			return bson.M{field: bson.M{"$ne": value}}
+			return bson.M{field: bson.M{"$ne": value}}, nil
 		case gpa.OpGreaterThan:
-			return bson.M{field: bson.M{"$gt": value}}
+			return bson.M{field: bson.M{"$gt": value}}, nil
 		case gpa.OpGreaterThanOrEqual:
-			return bson.M{field: bson.M{"$gte": value}}
+			return bson.M{field: bson.M{"$gte": value}}, nil
 		case gpa.OpLessThan:
-			return bson.M{field: bson.M{"$lt": value}}
+			return bson.M{field: bson.M{"$lt": value}}, nil
 		case gpa.OpLessThanOrEqual:
-			return bson.M{field: bson.M{"$lte": value}}
+			return bson.M{field: bson.M{"$lte": value}}, nil
 		case gpa.OpIn:
-			return bson.M{field: bson.M{"$in": value}}
+			return bson.M{field: bson.M{"$in": value}}, nil
 		case gpa.OpNotIn:
-			return bson.M{field: bson.M{"$nin": value}}
+			return bson.M{field: bson.M{"$nin": value}}, nil
 		default:
-			return bson.M{field: value}
+			return nil, gpa.NewError(gpa.ErrorTypeUnsupported, "MongoDB does not support condition operator "+string(operator))
 		}
+	case gpa.CompositeCondition:
+		filters := make([]bson.M, 0, len(cond.Conditions))
+		for _, nested := range cond.Conditions {
+			filter, err := r.buildConditionFilter(nested)
+			if err != nil {
+				return nil, err
+			}
+			filters = append(filters, filter)
+		}
+		if len(filters) == 0 {
+			return nil, gpa.NewError(gpa.ErrorTypeUnsupported, "empty composite conditions are not supported in MongoDB")
+		}
+		key := "$and"
+		if cond.Logic == gpa.LogicOr {
+			key = "$or"
+		}
+		values := make([]interface{}, len(filters))
+		for i, filter := range filters {
+			values[i] = filter
+		}
+		return bson.M{key: values}, nil
 	default:
-		// For now, return empty filter for complex conditions
-		return bson.M{}
+		return nil, gpa.NewError(gpa.ErrorTypeUnsupported, "MongoDB does not support this condition type")
 	}
+}
+
+func (r *Repository[T]) operationContext(ctx context.Context) context.Context {
+	if r.transactionContext != nil {
+		return r.transactionContext
+	}
+	return ctx
 }
 
 // Helper function to extract ID from entity
@@ -664,7 +707,7 @@ func extractID(entity interface{}) (interface{}, error) {
 	if v.Kind() == reflect.Ptr {
 		v = v.Elem()
 	}
-	
+
 	// Look for ID field
 	if v.Kind() == reflect.Struct {
 		if idField := v.FieldByName("ID"); idField.IsValid() {
@@ -675,7 +718,7 @@ func extractID(entity interface{}) (interface{}, error) {
 			return idField.Interface(), nil
 		}
 	}
-	
+
 	return nil, gpa.GPAError{
 		Type:    gpa.ErrorTypeInvalidArgument,
 		Message: "entity does not have an ID field",
@@ -845,7 +888,7 @@ func setEntityID(entity interface{}, id interface{}) error {
 // =====================================
 
 var (
-	_ gpa.Repository[any]     = (*Repository[any])(nil)
+	_ gpa.Repository[any]         = (*Repository[any])(nil)
 	_ gpa.DocumentRepository[any] = (*Repository[any])(nil)
-	_ gpa.Transaction[any]    = (*Transaction[any])(nil)
+	_ gpa.Transaction[any]        = (*Transaction[any])(nil)
 )

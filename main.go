@@ -24,6 +24,12 @@ type Provider struct {
 	config   gpa.Config
 }
 
+// Repository creates a type-safe repository from this provider instance.
+func (p *Provider) Repository[T any]() gpa.DocumentRepository[T] {
+	var zero T
+	return NewRepository[T](p.database.Collection(getCollectionName(zero)), p)
+}
+
 // NewProvider creates a new MongoDB provider instance
 func NewProvider(config gpa.Config) (*Provider, error) {
 	provider := &Provider{config: config}
@@ -128,11 +134,11 @@ func (p *Provider) Collection(name string) interface{} {
 // CreateIndex creates an index on a collection
 func (p *Provider) CreateIndex(ctx context.Context, collection string, keys interface{}, indexOptions *gpa.IndexOptions) error {
 	coll := p.database.Collection(collection)
-	
+
 	indexModel := mongo.IndexModel{
 		Keys: keys,
 	}
-	
+
 	if indexOptions != nil {
 		mongoOpts := &options.IndexOptions{}
 		if indexOptions.Unique {
@@ -152,7 +158,7 @@ func (p *Provider) CreateIndex(ctx context.Context, collection string, keys inte
 		}
 		indexModel.Options = mongoOpts
 	}
-	
+
 	_, err := coll.Indexes().CreateOne(ctx, indexModel)
 	return err
 }
@@ -172,35 +178,35 @@ func (p *Provider) ListIndexes(ctx context.Context, collection string) ([]gpa.In
 		return nil, err
 	}
 	defer cursor.Close(ctx)
-	
+
 	var indexes []gpa.IndexInfo
 	for cursor.Next(ctx) {
 		var indexDoc map[string]interface{}
 		if err := cursor.Decode(&indexDoc); err != nil {
 			continue
 		}
-		
+
 		indexInfo := gpa.IndexInfo{
 			Name:     indexDoc["name"].(string),
 			Fields:   []string{}, // Convert keys to field names
 			IsUnique: false,
 			Type:     gpa.IndexTypeStandard,
 		}
-		
+
 		// Convert MongoDB key document to field names
 		if keyDoc, ok := indexDoc["key"].(map[string]interface{}); ok {
 			for field := range keyDoc {
 				indexInfo.Fields = append(indexInfo.Fields, field)
 			}
 		}
-		
+
 		if unique, ok := indexDoc["unique"]; ok {
 			indexInfo.IsUnique = unique.(bool)
 		}
-		
+
 		indexes = append(indexes, indexInfo)
 	}
-	
+
 	return indexes, cursor.Err()
 }
 
@@ -211,12 +217,12 @@ func (p *Provider) Aggregate(ctx context.Context, collection string, pipeline in
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var results []interface{}
 	if err := cursor.All(ctx, &results); err != nil {
 		return nil, err
 	}
-	
+
 	return results, nil
 }
 
@@ -258,7 +264,7 @@ func buildConnectionURI(config gpa.Config) string {
 	}
 
 	if config.Username != "" && config.Password != "" {
-		return fmt.Sprintf("mongodb://%s:%s@%s:%d/%s", 
+		return fmt.Sprintf("mongodb://%s:%s@%s:%d/%s",
 			config.Username, config.Password, host, port, config.Database)
 	}
 
