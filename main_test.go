@@ -253,6 +253,13 @@ func TestGetCollectionName(t *testing.T) {
 }
 
 func TestApplyClientOptions(t *testing.T) {
+	// NewProvider dials and pings, so this needs a running MongoDB like every
+	// other test here. It was the one that reported its absence as a failure
+	// rather than using skipIfNoMongo, which made the whole module red on any
+	// machine without Mongo — ten seconds of server selection and then
+	// "connection refused".
+	skipIfNoMongo(t)
+
 	config := gpa.Config{
 		Options: map[string]interface{}{
 			"mongo": map[string]interface{}{
