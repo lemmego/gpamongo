@@ -3,7 +3,7 @@ module github.com/lemmego/gpamongo
 go 1.27
 
 require (
-	github.com/lemmego/gpa v0.1.1
+	github.com/lemmego/gpa v0.1.3
 	go.mongodb.org/mongo-driver v1.17.4
 )
 
